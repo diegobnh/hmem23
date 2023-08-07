@@ -107,17 +107,15 @@ void get_call_stack(char *call_stack) {
           //fprintf(stderr,"ENTROU:%s\n", g_line);
           for(i=0;i<len;i++)
           {
-	  	if(g_line[i] == '[')
-		{
-		     break;
-		}
+	      if(g_line[i] == '[')
+	          break;
           }
           for(i=i+1; i<len;i++)
           {
-		if(g_line[i] ==']')
-                    break;
-                call_stack[k] = g_line[i];
-                k++;
+	      if(g_line[i] ==']')
+                  break;
+              call_stack[k] = g_line[i];
+              k++;
 	  }
           call_stack[k] = ':';
           k++;
@@ -131,27 +129,21 @@ void get_call_stack(char *call_stack) {
 
 
 static int
-hook(long syscall_number,
-			long arg0, long arg1,
-			long arg2, long arg3,
-			long arg4, long arg5,
-			long *result)
+hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4, long arg5, long *result)
 {
-
-        int static mmap_id=0;
-        int i;
-        struct timespec ts;
         char size[SIZE];
         char chunk_index[3];
         char temp_call_stack[SIZE];
         char call_stack[SIZE]="";
+	int static mmap_id=0;
+        int i;
+	int total_obj;
         unsigned long long remnant_size;
-        int total_obj;
         unsigned long call_stack_hash;
         unsigned long g_nodemask;
+	struct timespec ts;
 
 	if (syscall_number == SYS_mmap) {
-
 	       *result = syscall_no_intercept(syscall_number, arg0, arg1, arg2, arg3, arg4, arg5);
 
 	       pthread_mutex_lock(&g_count_mutex);
@@ -165,7 +157,6 @@ hook(long syscall_number,
 		    remnant_size = arg1 - (total_obj * CHUNK_SIZE);
 
 		    while(i < total_obj){
-
                          memset(&temp_call_stack[0], 0, sizeof(temp_call_stack));
                          memset(&size[0], 0, sizeof(size));
                          memset(&chunk_index[0], 0, sizeof(chunk_index));
@@ -191,9 +182,7 @@ hook(long syscall_number,
                              fprintf(stderr,"Error:%d\n",errno);
                              perror("Error description");
                          }
-
 		         i++;
-
 		    }
 		    if(remnant_size > 0){
                          memset(&temp_call_stack[0], 0, sizeof(temp_call_stack));
@@ -242,50 +231,44 @@ hook(long syscall_number,
                          }
 
 		    }
-	       }else{
-                     memset(&temp_call_stack[0], 0, sizeof(temp_call_stack));
-                     memset(&size[0], 0, sizeof(size));
-                     memset(&chunk_index[0], 0, sizeof(chunk_index));
+	       }//end of test arg1 > CHUNK_SIZE
+	       else{
+                   memset(&temp_call_stack[0], 0, sizeof(temp_call_stack));
+                   memset(&size[0], 0, sizeof(size));
+                   memset(&chunk_index[0], 0, sizeof(chunk_index));
 
-                     strcat(temp_call_stack,call_stack);
-                     sprintf(size, ":%d", arg1);
-                     strcat(temp_call_stack, size);
-                     sprintf(chunk_index, ":%d", 0);
-                     strcat(temp_call_stack, chunk_index);
+                   strcat(temp_call_stack,call_stack);
+                   sprintf(size, ":%d", arg1);
+                   strcat(temp_call_stack, size);
+                   sprintf(chunk_index, ":%d", 0);
+                   strcat(temp_call_stack, chunk_index);
 
-                     //fprintf(stderr, "original %s\n", call_stack);
-                     //fprintf(stderr, "adaptado %s\n", temp_call_stack);
+                   //fprintf(stderr, "original %s\n", call_stack);
+                   //fprintf(stderr, "adaptado %s\n", temp_call_stack);
 
-                     if(check_address(hash(temp_call_stack))){
-                         fprintf(stderr,"binding to dram :%d\n",hash(temp_call_stack));
-                         g_nodemask = 1;
-                     }else{
-                         g_nodemask = 4;
-                     }
-                     if(mbind((void *)*result, (unsigned long)arg1, MPOL_BIND, &g_nodemask, 64, MPOL_MF_MOVE) == -1)
-                     {
-                         fprintf(stderr,"Error:%d\n",errno);
-                         perror("Error description");
-                     }
-
+                   if(check_address(hash(temp_call_stack))){
+                       fprintf(stderr,"binding to dram :%d\n",hash(temp_call_stack));
+                       g_nodemask = 1;
+                   }else{
+                       g_nodemask = 4;
+                   }
+                   if(mbind((void *)*result, (unsigned long)arg1, MPOL_BIND, &g_nodemask, 64, MPOL_MF_MOVE) == -1)
+                   {
+                       fprintf(stderr,"Error:%d\n",errno);
+                       perror("Error description");
+                   }
 	       }
 
    	       pthread_mutex_unlock(&g_count_mutex);
-
 	       return 0;
-	}else if(syscall_number == SYS_munmap){
-		/* pass it on to the kernel */
-		*result = syscall_no_intercept(syscall_number, arg0, arg1, arg2, arg3, arg4, arg5);
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-
-		return 0;
+	}//end of test syscall_number == SYS_mmap
+	else if(syscall_number == SYS_munmap){
+	    /* pass it on to the kernel */
+	    *result = syscall_no_intercept(syscall_number, arg0, arg1, arg2, arg3, arg4, arg5);
+	    clock_gettime(CLOCK_MONOTONIC, &ts);
+  	    return 0;
 	}else {
-		/*
-		 * Ignore any other syscalls
-		 * i.e.: pass them on to the kernel
-		 * as would normally happen.
-		 */
-		return 1;
+	    return 1;
 	}
 }
 
