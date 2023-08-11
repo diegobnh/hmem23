@@ -1,3 +1,9 @@
+//gcc -O2 -fPIC -shared mmap_intercept.c -o mmap_intercept.so -lsyscall_intercept -lnuma
+
+//export APP="<<your_app>>"
+
+//LD_PRELOAD=./mmap_intercept.so <<your_app>>
+
 #include <libsyscall_intercept_hook_point.h>
 #include <syscall.h>
 #include <errno.h>
@@ -13,22 +19,29 @@
 #include <pthread.h>
 #include <sys/resource.h>
 #include <numaif.h>
-#define SIZE 2048              // callstack string size
-#define CHUNK_SIZE 500002816UL // chunk size aligned with pages of 4096 bytes
+#include <sys/mman.h>
+#define SIZE 4096               // callstack string size
+#define CHUNK_SIZE 1000001536UL  // chunk size aligned with pages of 4096 bytes
+#define DRAM 1
+#define CXL  2
+
 
 FILE *g_fp = NULL;
 FILE *fp_bind = NULL;
-char *g_line = NULL;
+
+char g_line[SIZE];
+char call_stack[SIZE];
 
 pthread_mutex_t g_count_mutex;
 unsigned long g_call_stack_vector[SIZE];
 
+//First line is the number of objects to bind
 void read_parameters_for_binding(void)
 {
     int call_stack_size;
     int i;
 
-    fp_bind = fopen("static_mapping.txt", "r");
+    fp_bind = fopen("/store/hmem23/static_mapping.txt", "r");
     if (fp_bind == NULL)
     {
         fprintf(stderr, "Error open bind text!\n");
@@ -83,14 +96,14 @@ void redirect_stdout(char *filename)
     }
     close(fd);
 
-    g_fp = fopen("call_stack.txt", "w+");
+    g_fp = fopen("/tmp/call_stack_bind.txt", "w+");
     if (g_fp == NULL)
     {
         printf("Error when try to use fopen!!\n");
     }
 }
 
-void get_call_stack(char *call_stack)
+void get_call_stack()
 {
     char *addr;
     char **strings;
@@ -101,7 +114,7 @@ void get_call_stack(char *call_stack)
     int i;
     int k = 0;
     void *buffer[SIZE];
-    size_t len = 0;
+    size_t len = SIZE;
     ssize_t read;
 
     nptrs = backtrace(buffer, SIZE);
@@ -111,11 +124,16 @@ void get_call_stack(char *call_stack)
     // while ((read = getline(&g_line, &len, g_fp)) != -1) {
     for (int callstack_line_index = 0; callstack_line_index < nptrs; callstack_line_index++)
     {
-        read = getline(&g_line, &len, g_fp);
+ //read = getline(&g_line, &len, g_fp);
+ p = fgets(g_line,len,g_fp);
+ if(p == NULL){
+ fprintf(stderr,"fgets NULL\n");
+ return;
+ }
         p = strstr(g_line, substring);
         if (p)
         {
-            // fprintf(stderr,"ENTROU:%s\n", g_line);
+            //fprintf(stderr,"ENTROU:%s\n", g_line);
             for (i = 0; i < len; i++)
             {
                 if (g_line[i] == '[')
@@ -131,9 +149,9 @@ void get_call_stack(char *call_stack)
             call_stack[k] = ':';
             k++;
         }
-        // else{
-        //     fprintf(stderr,"NAO ENTROU:%s\n", g_line);
-        // }
+       // else{
+       //      fprintf(stderr,"NAO ENTROU:%s\n", g_line);
+       // }
     }
     call_stack[k - 1] = '\0';
 }
@@ -141,7 +159,8 @@ void get_call_stack(char *call_stack)
 static int
 hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4, long arg5, long *result)
 {
-    char size[SIZE];
+    char size[SIZE]; // chunk size
+    char obj_size[SIZE]; //object size
     char chunk_index[3];
     char temp_call_stack[SIZE];
     char call_stack[SIZE] = "";
@@ -152,14 +171,26 @@ hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4,
     unsigned long call_stack_hash;
     unsigned long g_nodemask;
     struct timespec ts;
+    int flags;
+
+    flags = (int) arg3;
+    sprintf(obj_size, ":%ld", arg1);
 
     if (syscall_number == SYS_mmap)
     {
+ if ((flags & MAP_ANONYMOUS) != MAP_ANONYMOUS) {
+ return 1;
+  }
+
+ if ((flags & MAP_STACK) == MAP_STACK) {
+    return 1;
+ }
+
         *result = syscall_no_intercept(syscall_number, arg0, arg1, arg2, arg3, arg4, arg5);
 
         pthread_mutex_lock(&g_count_mutex);
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        get_call_stack(call_stack);
+        get_call_stack();
         // fprintf(stderr,"%s,%d\n",call_stack,hash(call_stack));
 
         if (arg1 > CHUNK_SIZE)
@@ -177,6 +208,7 @@ hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4,
                 // fprintf(stderr, "iter:%d\n",i);
                 strcat(temp_call_stack, call_stack);
                 sprintf(size, ":%d", CHUNK_SIZE);
+                strcat(temp_call_stack, obj_size);
                 strcat(temp_call_stack, size);
                 sprintf(chunk_index, ":%d", i);
                 strcat(temp_call_stack, chunk_index);
@@ -187,11 +219,12 @@ hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4,
                 if (check_address(hash(temp_call_stack)))
                 {
                     fprintf(stderr, "binding to dram :%d\n", hash(temp_call_stack));
-                    g_nodemask = 1;
+                    g_nodemask = DRAM; // NUMA 1 (CPU+MEM); // NUMA 0 ??
                 }
                 else
                 {
-                    g_nodemask = 4;
+                    fprintf(stderr, "binding to CXL :%d\n", hash(temp_call_stack));
+                    g_nodemask = CXL; // NUMA 100 = NUMA 2 ?
                 }
                 if (mbind((void *)*result + (i * CHUNK_SIZE), (unsigned long)CHUNK_SIZE, MPOL_BIND, &g_nodemask, 64, MPOL_MF_MOVE) == -1)
                 {
@@ -208,6 +241,7 @@ hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4,
 
                 strcat(temp_call_stack, call_stack);
                 sprintf(size, ":%d", remnant_size);
+                strcat(temp_call_stack, obj_size);
                 strcat(temp_call_stack, size);
                 sprintf(chunk_index, ":%d", i);
                 strcat(temp_call_stack, chunk_index);
@@ -215,11 +249,12 @@ hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4,
                 if (check_address(hash(temp_call_stack)))
                 {
                     fprintf(stderr, "binding to dram :%d\n", hash(temp_call_stack));
-                    g_nodemask = 1;
+                    g_nodemask = DRAM;
                 }
                 else
                 {
-                    g_nodemask = 4;
+                    fprintf(stderr, "binding to CXL :%d\n", hash(temp_call_stack));
+                    g_nodemask = CXL;
                 }
                 if (mbind((void *)*result + (i * CHUNK_SIZE), (unsigned long)remnant_size, MPOL_BIND, &g_nodemask, 64, MPOL_MF_MOVE) == -1)
                 {
@@ -235,6 +270,7 @@ hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4,
 
                 strcat(temp_call_stack, call_stack);
                 sprintf(size, ":%d", CHUNK_SIZE);
+                strcat(temp_call_stack, obj_size);
                 strcat(temp_call_stack, size);
                 sprintf(chunk_index, ":%d", i);
                 strcat(temp_call_stack, chunk_index);
@@ -242,11 +278,12 @@ hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4,
                 if (check_address(hash(temp_call_stack)))
                 {
                     fprintf(stderr, "binding to dram :%d\n", hash(temp_call_stack));
-                    g_nodemask = 1;
+                    g_nodemask = DRAM;
                 }
                 else
                 {
-                    g_nodemask = 4;
+                    fprintf(stderr, "binding to CXL :%d\n", hash(temp_call_stack));
+                    g_nodemask = CXL;
                 }
                 if (mbind((void *)*result + (i * CHUNK_SIZE), (unsigned long)CHUNK_SIZE, MPOL_BIND, &g_nodemask, 64, MPOL_MF_MOVE) == -1)
                 {
@@ -263,6 +300,7 @@ hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4,
 
             strcat(temp_call_stack, call_stack);
             sprintf(size, ":%d", arg1);
+            strcat(temp_call_stack, obj_size);
             strcat(temp_call_stack, size);
             sprintf(chunk_index, ":%d", 0);
             strcat(temp_call_stack, chunk_index);
@@ -273,11 +311,12 @@ hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4,
             if (check_address(hash(temp_call_stack)))
             {
                 fprintf(stderr, "binding to dram :%d\n", hash(temp_call_stack));
-                g_nodemask = 1;
+                g_nodemask = DRAM;
             }
             else
             {
-                g_nodemask = 4;
+                fprintf(stderr, "binding to CXL :%d\n", hash(temp_call_stack));
+                g_nodemask = CXL;
             }
             if (mbind((void *)*result, (unsigned long)arg1, MPOL_BIND, &g_nodemask, 64, MPOL_MF_MOVE) == -1)
             {
@@ -305,7 +344,7 @@ static __attribute__((constructor)) void
 init(int argc, char *argv[])
 {
     setvbuf(stdout, NULL, _IONBF, 0); // avoid buffer from printf
-    redirect_stdout("call_stack.txt");
+    redirect_stdout("/tmp/call_stack_bind.txt");
     read_parameters_for_binding();
     intercept_hook_point = hook;
 }

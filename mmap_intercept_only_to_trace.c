@@ -1,3 +1,8 @@
+//gcc -O2 -fPIC -shared mmap_intercept_only_to_trace.c -o mmap_intercept_only_to_trace.so -lsyscall_intercept
+
+//export APP="<<your_app>>"
+
+//LD_PRELOAD=./mmap_intercept_only_to_trace.so <<your_app>>
 
 #include <libsyscall_intercept_hook_point.h>
 #include <syscall.h>
@@ -12,13 +17,20 @@
 #include <sys/time.h>
 #include <pthread.h>
 #include <sys/resource.h>
-#define _GNU_SOURCE
-#define SIZE 2048               // callstack string size
-#define CHUNK_SIZE 500002816UL // chunk size aligned with pages of 4096 bytes
+#include <stdbool.h>
+#include <sys/mman.h>
 
-char *g_line = NULL;
+#define _GNU_SOURCE
+#define SIZE 4096               // callstack string size
+#define CHUNK_SIZE 1000001536UL // chunk size aligned with pages of 4096 bytes
+
+char g_line[SIZE];
+char call_stack[SIZE];
+
 FILE *g_fp = NULL;
 pthread_mutex_t g_count_mutex;
+
+static bool internal_call = false;
 
 long int hash(char *word)
 {
@@ -46,13 +58,14 @@ void redirect_stdout(char *filename)
     }
     close(fd);
 
-    g_fp = fopen("call_stack.txt", "w+");
+    g_fp = fopen("/tmp/call_stack.txt", "w+");
     if (g_fp == NULL)
     {
         printf("Error when try to use fopen!!\n");
     }
 }
-void get_call_stack(char *call_stack)
+
+void get_call_stack()
 {
     char *addr;
     char *p;
@@ -63,18 +76,28 @@ void get_call_stack(char *call_stack)
     int k = 0;
     void *buffer[SIZE];
     ssize_t read;
-    size_t len = 0;
+    size_t len = SIZE;
 
     nptrs = backtrace(buffer, SIZE);
     backtrace_symbols_fd(buffer, nptrs, STDOUT_FILENO);
-    fflush(stdout);
+    //fflush(stdout);
+    //
 
     const char *substring = getenv("APP");
+
+    //return;
 
     // while ((read = getline(&g_line, &len, g_fp)) != -1) {
     for (int callstack_line_index = 0; callstack_line_index < nptrs; callstack_line_index++)
     {
-        read = getline(&g_line, &len, g_fp);
+        //read = getline(&g_line, &len, g_fp);
+ p = fgets(g_line,len,g_fp);
+ if(p == NULL){
+ fprintf(stderr,"fgets NULL\n");
+ return;
+ }
+ //fprintf(stderr,"g_line = start %s end read %u len %u \n",g_line,read,len);
+ //fprintf(stderr,"g_line = start %s end\n",g_line);
         p = strstr(g_line, substring);
         if (p)
         {
@@ -99,22 +122,46 @@ void get_call_stack(char *call_stack)
 
 static int hook(long syscall_number, long arg0, long arg1, long arg2, long arg3, long arg4, long arg5, long *result)
 {
-    char size[SIZE];
+    char size[SIZE]; // Chunk size
+    char obj_size[SIZE]; // object size to distinguish hash for the same call_stack
     char chunk_index[3];
     char temp_call_stack[SIZE];
-    char call_stack[SIZE] = "";
     int static mmap_id = 0;
     int total_obj;
     int i;
     unsigned long long remnant_size;
     struct timespec ts;
+    int flags;
+
+    //if (internal_call) {
+    // return 1;
+    //}
+
+    flags = (int) arg3;
+    sprintf(obj_size, ":%ld", arg1);
 
     if (syscall_number == SYS_mmap)
     {
+
+ if ((flags & MAP_ANONYMOUS) != MAP_ANONYMOUS) {
+ return 1;
+  }
+
+ if ((flags & MAP_STACK) == MAP_STACK) {
+    return 1;
+ }
+
+
         *result = syscall_no_intercept(syscall_number, arg0, arg1, arg2, arg3, arg4, arg5);
+
         pthread_mutex_lock(&g_count_mutex);
+
+ //internal_call = true;
+
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        get_call_stack(call_stack);
+
+        get_call_stack();
+
         i = 0;
         if (arg1 > CHUNK_SIZE)
         {
@@ -128,6 +175,7 @@ static int hook(long syscall_number, long arg0, long arg1, long arg2, long arg3,
 
                 strcat(temp_call_stack, call_stack);
                 sprintf(size, ":%d", CHUNK_SIZE);
+                strcat(temp_call_stack, obj_size);
                 strcat(temp_call_stack, size);
                 sprintf(chunk_index, ":%d", i);
                 strcat(temp_call_stack, chunk_index);
@@ -143,6 +191,7 @@ static int hook(long syscall_number, long arg0, long arg1, long arg2, long arg3,
 
                 strcat(temp_call_stack, call_stack);
                 sprintf(size, ":%d", remnant_size);
+                strcat(temp_call_stack, obj_size);
                 strcat(temp_call_stack, size);
                 sprintf(chunk_index, ":%d", i);
                 strcat(temp_call_stack, chunk_index);
@@ -157,6 +206,7 @@ static int hook(long syscall_number, long arg0, long arg1, long arg2, long arg3,
 
                 strcat(temp_call_stack, call_stack);
                 sprintf(size, ":%d", CHUNK_SIZE);
+                strcat(temp_call_stack, obj_size);
                 strcat(temp_call_stack, size);
                 sprintf(chunk_index, ":%d", i);
                 strcat(temp_call_stack, chunk_index);
@@ -172,6 +222,7 @@ static int hook(long syscall_number, long arg0, long arg1, long arg2, long arg3,
 
             strcat(temp_call_stack, call_stack);
             sprintf(size, ":%d", arg1);
+            strcat(temp_call_stack, obj_size);
             strcat(temp_call_stack, size);
             sprintf(chunk_index, ":%d", i);
             strcat(temp_call_stack, chunk_index);
@@ -179,14 +230,23 @@ static int hook(long syscall_number, long arg0, long arg1, long arg2, long arg3,
             fprintf(stderr, "%ld.%ld,mmap,%ld,%p,%ld,%s\n", ts.tv_sec, ts.tv_nsec, arg1, (void *)*result, hash(temp_call_stack), temp_call_stack);
         }
 
+ //internal_call = false;
+
         pthread_mutex_unlock(&g_count_mutex);
         return 0;
 
     } // end of test syscall_number == SYS_mmap
     else if (syscall_number == SYS_munmap)
     {
+ if (internal_call) {
+      return 1;
+ }
+
         /* pass it on to the kernel */
         *result = syscall_no_intercept(syscall_number, arg0, arg1, arg2, arg3, arg4, arg5);
+
+// internal_call = true;
+
         clock_gettime(CLOCK_MONOTONIC, &ts);
 
         if (arg1 > CHUNK_SIZE)
@@ -212,10 +272,12 @@ static int hook(long syscall_number, long arg0, long arg1, long arg2, long arg3,
         { // end of test arg1 > CHUNK_SIZE
             fprintf(stderr, "%ld.%ld,munmap,%p,%ld\n", ts.tv_sec, ts.tv_nsec, (void *)arg0, arg1);
         }
+// internal_call = false;
         return 0;
     } // enf of test syscall_number == SYS_munmap
     else
     {
+// internal_call = false;
         return 1;
     }
 }
@@ -224,6 +286,6 @@ static __attribute__((constructor)) void
 init(int argc, char *argv[])
 {
     setvbuf(stdout, NULL, _IONBF, 0); // avoid buffer from printf
-    redirect_stdout("call_stack.txt");
+    redirect_stdout("/tmp/call_stack.txt");
     intercept_hook_point = hook;
 }
